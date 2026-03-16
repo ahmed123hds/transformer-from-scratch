@@ -1,14 +1,3 @@
-"""
-train.py -- Transformer Copy Task
-
-Trains the completed Transformer encoder-decoder model on a synthetic "copy" task.
-The copy task is simple: given a random sequence of numbers (e.g., [3, 7, 2, ...]),
-the model learns to copy it to the output.
-
-This proves that all the dimensions, embeddings, multi-head attention blocks,
-cross-attention, masking, and gradients work properly end-to-end.
-"""
-
 import time
 import argparse
 import torch
@@ -36,30 +25,62 @@ def make_std_mask(tgt, pad_id):
     tgt_mask = tgt_pad_mask & tgt_sub_mask
     return tgt_mask
 
-def data_generator(batch_size, num_batches, seq_len, vocab_size, device):
-    """
-    Generate synthetic data for a copy task.
-    """
-    for _ in range(num_batches):
-        # Generate random tokens between 1 and vocab_size (0 is reserved for padding)
-        data = torch.randint(1, vocab_size, (batch_size, seq_len), device=device)
+def load_data(path, max_len=32):
+    with open(path, 'r', encoding='utf-8') as f:
+        lines = f.read().strip().split('\n')
+    
+    src_texts = []
+    tgt_texts = []
+    
+    for line in lines:
+        parts = line.split('\t')
+        if len(parts) >= 2:
+            src_texts.append(parts[1].strip() + "<EOS>") # German is source
+            tgt_texts.append(parts[0].strip() + "<EOS>") # English is target
+            
+    # Simple character-level tokenizer
+    chars = sorted(list(set("".join(src_texts + tgt_texts))))
+    vocab_size = len(chars) + 2 # + pad, + unk
+    pad_id = 0
+    unk_id = 1
+    
+    char2id = {c: i+2 for i, c in enumerate(chars)}
+    
+    def encode(text):
+        return [char2id.get(c, unk_id) for c in text][:max_len]
         
-        # In a generic setup, the source mask prevents attending to padded values
-        # We don't have padding here, so it is just a mask of all 1s
-        src_mask = torch.ones((batch_size, 1, seq_len, seq_len), device=device).bool()
-        
-        # Teacher forcing inputs: remove the last element for the decoder input
-        tgt_in = data[:, :-1]
-        
-        # Target truths: remove the first element (shift by 1)
-        tgt_out = data[:, 1:]
-        
-        # Build causal mask for target input
-        tgt_mask = make_std_mask(tgt_in, pad_id=0)
-        
-        yield data, tgt_in, src_mask, tgt_mask, tgt_out
+    src_data = [encode(t) for t in src_texts]
+    tgt_data = [encode(t) for t in tgt_texts]
+    
+    return src_data, tgt_data, vocab_size, pad_id
 
-def train_epoch(model, optimizer, data_gen, eval_interval=100):
+def data_generator(src_data, tgt_data, batch_size, max_len, pad_id, device):
+    """
+    Generate batches.
+    """
+    num_batches = len(src_data) // batch_size
+    for i in range(num_batches):
+        batch_src = src_data[i*batch_size : (i+1)*batch_size]
+        batch_tgt = tgt_data[i*batch_size : (i+1)*batch_size]
+        
+        # Pad sequences
+        src = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+        tgt = torch.full((batch_size, max_len), pad_id, dtype=torch.long, device=device)
+        
+        for b in range(batch_size):
+            src[b, :len(batch_src[b])] = torch.tensor(batch_src[b])
+            tgt[b, :len(batch_tgt[b])] = torch.tensor(batch_tgt[b])
+            
+        src_mask = (src != pad_id).unsqueeze(1).unsqueeze(2)
+        
+        tgt_in = tgt[:, :-1]
+        tgt_out = tgt[:, 1:]
+        
+        tgt_mask = make_std_mask(tgt_in, pad_id)
+        
+        yield src, tgt_in, src_mask, tgt_mask, tgt_out
+
+def train_epoch(model, optimizer, data_gen, eval_interval=10):
     """
     Single train loop.
     """
@@ -70,7 +91,6 @@ def train_epoch(model, optimizer, data_gen, eval_interval=100):
     for i, (src, tgt_in, src_mask, tgt_mask, tgt_out) in enumerate(data_gen):
         optimizer.zero_grad()
         
-        # Forward pass returning cross-entropy loss directly
         logits, loss = model(
             src_seq  = src,
             tgt_seq  = tgt_in,
@@ -93,11 +113,9 @@ def run_experiment(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on: {device}")
     
-    # Hyperparameters for the synthetic task
-    vocab_size = args.vocab_size
-    seq_len    = args.seq_len
-    
-    # The original paper used d_model=512, but we'll scale it down for this quick test
+    src_data, tgt_data, vocab_size, pad_id = load_data("data/deu_subset.txt", args.seq_len)
+    print(f"Loaded {len(src_data)} translation pairs. Vocab size: {vocab_size}")
+
     config = TransformerConfig(
         src_vocab_size = vocab_size,
         tgt_vocab_size = vocab_size,
@@ -106,27 +124,24 @@ def run_experiment(args):
         num_decoder    = args.num_layers,
         num_heads      = args.num_heads,
         d_ff           = args.d_model * 4,
-        pad_token_id   = 0,
+        pad_token_id   = pad_id,
         dropout        = 0.1
     )
     
     model = Transformer(config).to(device)
     print(f"Initialized Transformer with {model.count_parameters():,} parameters.")
     
-    # Optimizer (Adam with relatively high learning rate since task is trivial)
     optimizer = Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98), eps=1e-9)
     
     for epoch in range(1, args.epochs + 1):
         print(f"\n--- Epoch {epoch} ---")
-        generator = data_generator(args.batch_size, args.batches, seq_len, vocab_size, device)
-        train_epoch(model, optimizer, generator, eval_interval=50)
+        generator = data_generator(src_data, tgt_data, args.batch_size, args.seq_len, pad_id, device)
+        train_epoch(model, optimizer, generator, eval_interval=10)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("--epochs",     type=int, default=3)
-    p.add_argument("--batches",    type=int, default=500)
+    p.add_argument("--epochs",     type=int, default=1)
     p.add_argument("--batch_size", type=int, default=32)
-    p.add_argument("--vocab_size", type=int, default=100)
     p.add_argument("--seq_len",    type=int, default=32)
     p.add_argument("--d_model",    type=int, default=64)
     p.add_argument("--num_layers", type=int, default=2)
