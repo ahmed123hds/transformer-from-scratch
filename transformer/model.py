@@ -178,8 +178,8 @@ class Transformer(nn.Module):
         if targets is not None:
             # Flatten predictions and targets to calculate the loss
             loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), 
-                targets.view(-1), 
+                logits.reshape(-1, logits.size(-1)), 
+                targets.reshape(-1), 
                 ignore_index=self.config.pad_token_id
             )
 
